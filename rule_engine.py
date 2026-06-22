@@ -1,7 +1,7 @@
 from typing import List, Dict, Tuple, Optional
 from database import (
     get_rules, get_transactions, update_transaction_category,
-    add_rule, add_category
+    add_rule, add_category, get_categories
 )
 from csv_importer import classify_by_rules
 
@@ -10,6 +10,7 @@ def apply_rules_to_transactions(txn_ids: Optional[List[int]] = None,
                                 start_date: Optional[str] = None,
                                 end_date: Optional[str] = None) -> Tuple[int, int]:
     rules = get_rules()
+    categories = get_categories()
     txns = get_transactions(start_date, end_date)
 
     if txn_ids:
@@ -21,7 +22,7 @@ def apply_rules_to_transactions(txn_ids: Optional[List[int]] = None,
     for txn in txns:
         amount_for_classify = txn["amount"] if txn["type"] == "income" else -txn["amount"]
         new_category, new_rule_id, _ = classify_by_rules(
-            txn["description"], amount_for_classify, rules
+            txn["description"], amount_for_classify, rules, txn["type"], categories
         )
 
         if new_category != txn["category"] or new_rule_id != txn.get("rule_id"):
@@ -63,9 +64,12 @@ def extract_key_keyword(description: str) -> str:
     return description[:4] if len(description) >= 4 else description
 
 
-def find_matching_rules(description: str, rules: List[Dict]) -> List[Dict]:
+def find_matching_rules(description: str, rules: List[Dict],
+                        txn_type: Optional[str] = None) -> List[Dict]:
     matches = []
     for rule in rules:
+        if txn_type and rule["type"] != txn_type:
+            continue
         if rule["keyword"] in description:
             matches.append(rule)
     matches.sort(key=lambda r: r["priority"], reverse=True)

@@ -108,21 +108,34 @@ def parse_amount(amount_val) -> Optional[float]:
 
 
 def classify_by_rules(description: str, amount: float,
-                      rules: List[Dict]) -> Tuple[Optional[str], Optional[int], str]:
+                      rules: List[Dict],
+                      txn_type: Optional[str] = None,
+                      categories: Optional[List[Dict]] = None) -> Tuple[Optional[str], Optional[int], str]:
+    if txn_type is None:
+        txn_type = "income" if amount >= 0 else "expense"
+
     matched_category = None
     matched_rule_id = None
     highest_priority = -1
 
+    cat_type_map = {}
+    if categories:
+        for cat in categories:
+            cat_type_map[cat["name"]] = cat["type"]
+
     for rule in rules:
+        if rule["type"] != txn_type:
+            continue
         if rule["keyword"] in description and rule["priority"] > highest_priority:
+            if cat_type_map and rule["category"] in cat_type_map:
+                if cat_type_map[rule["category"]] != txn_type:
+                    continue
             highest_priority = rule["priority"]
             matched_category = rule["category"]
             matched_rule_id = rule["id"]
 
-    txn_type = "income" if amount >= 0 else "expense"
-
     if matched_category is None:
-        default_cat = "其他收入" if amount >= 0 else "其他支出"
+        default_cat = "其他收入" if txn_type == "income" else "其他支出"
         return default_cat, None, "uncategorized"
 
     return matched_category, matched_rule_id, "categorized"
@@ -259,7 +272,13 @@ def validate_and_classify(df: pd.DataFrame) -> Dict:
             continue
         file_seen_keys.add(dup_key)
 
-        category, rule_id, status = classify_by_rules(description, amount if txn_type == "income" else -amount, rules)
+        category, rule_id, status = classify_by_rules(
+            description,
+            amount if txn_type == "income" else -amount,
+            rules,
+            txn_type,
+            categories
+        )
 
         row_data = {
             "row_num": row_num,
