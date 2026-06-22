@@ -185,20 +185,35 @@ def render_import_page():
 
                 if st.button("🚀 确认导入数据", type="primary"):
                     inserted, duplicates = insert_valid_rows(valid_preview)
-                    st.success(f"导入完成！新增 {inserted} 条，跳过 {duplicates + result['stats']['duplicates']} 条重复")
+                    msg = f"导入完成！新增 {inserted} 条，跳过重复 {duplicates + result['stats']['duplicates']} 条"
+                    if duplicates + result['stats']['duplicates'] > 0:
+                        st.warning(msg + " ⚠️ 重复导入已自动跳过，不会产生重复数据")
+                    else:
+                        st.success(msg)
 
                     has_internal_keywords = False
                     internal_count = 0
+                    income_internal = 0
+                    expense_internal = 0
                     for r in valid_preview:
                         if any(kw in r["description"] for kw in INTERNAL_KEYWORDS_ALL):
                             internal_count += 1
                             has_internal_keywords = True
+                            if r["type"] == "income":
+                                income_internal += 1
+                            else:
+                                expense_internal += 1
 
                     if has_internal_keywords:
-                        st.info(
-                            f"💡 检测到 {internal_count} 条可能为内部转账/报销的流水，"
-                            f"建议前往「内部转账」页面进行归并处理"
+                        internal_msg = (
+                            f"💡 检测到 {internal_count} 条可能为内部转账/报销的流水 "
+                            f"(收入{income_internal}条/支出{expense_internal}条)\n\n"
+                            f"常见场景:\n"
+                            f"• 双收入: 微信零钱提现 + 银行卡到账 → 请前往「内部转账」归并\n"
+                            f"• 双支出: 信用卡还款 + 自动扣款 → 请前往「内部转账」归并\n"
+                            f"• 一收一支: 普通银行转账、同事报销抵扣 → 系统自动提示候选"
                         )
+                        st.info(internal_msg)
 
                     if stats["uncategorized"] > 0:
                         st.info("💡 建议前往「分类规则」页面，从高频未分类描述中生成规则")
@@ -975,6 +990,10 @@ def render_candidates_tab():
         col2.metric("中置信度 (0.4-0.7)", len(med_conf))
         col3.metric("低置信度 (<0.4)", len(low_conf))
 
+        same_dir_count = len([c for c in candidates if c.get("same_direction", False)])
+        if same_dir_count > 0:
+            st.info(f"📌 其中包含 {same_dir_count} 个同方向配对 (双收入/双支出)，请仔细核对角色")
+
         st.divider()
 
         for idx, candidate in enumerate(candidates):
@@ -984,17 +1003,23 @@ def render_candidates_tab():
                 type_label = "报销抵扣" if candidate["type"] == "reimbursement" else "内部转账"
                 type_icon = "💼" if candidate["type"] == "reimbursement" else "🔄"
 
+                same_direction = candidate.get("same_direction", False)
+
                 warnings = []
                 if candidate["cross_month"]:
-                    warnings.append("⚠️ 跨月匹配")
+                    warnings.append("⚠️ 跨月匹配 - 建议确认是否为同一笔业务")
                 if not candidate["amount_match"]:
                     warnings.append(f"⚠️ 金额不一致 (差¥{candidate['amount_diff']})")
+                if same_direction:
+                    dir_label = "双收入" if candidate["items"][0]["transaction"]["type"] == "income" else "双支出"
+                    warnings.append(f"⚠️ 同方向配对({dir_label}) - 请确认角色分配是否正确")
 
                 st.markdown(f"""
                 <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; margin: 8px 0;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div>
                             <span style="font-size: 1.1em; font-weight: bold;">{type_icon} {type_label}</span>
+                            {"<span style='margin-left: 8px; background: #fff3cd; color: #856404; padding: 2px 8px; border-radius: 4px; font-size: 0.8em;'>同方向配对</span>" if same_direction else ""}
                             <span style="margin-left: 12px; color: {conf_color}; font-weight: bold;">
                                 置信度: {confidence:.2f}
                             </span>
@@ -1094,10 +1119,18 @@ def render_confirmed_tab():
     transfer_count = len([t for t in transfers if t["transfer_type"] == "transfer"])
     reimburse_count = len([t for t in transfers if t["transfer_type"] == "reimbursement"])
 
-    col1, col2, col3 = st.columns(3)
+    same_direction_count = 0
+    for t in transfers:
+        if t["items"]:
+            types = {item["type"] for item in t["items"]}
+            if len(types) == 1:
+                same_direction_count += 1
+
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("归并总数", len(transfers))
     col2.metric("内部转账", transfer_count)
     col3.metric("报销抵扣", reimburse_count)
+    col4.metric("同方向配对", same_direction_count)
 
     st.divider()
 
@@ -1105,12 +1138,29 @@ def render_confirmed_tab():
         type_icon = "💼" if t["transfer_type"] == "reimbursement" else "🔄"
         type_label = "报销抵扣" if t["transfer_type"] == "reimbursement" else "内部转账"
 
-        with st.expander(
-            f"{type_icon} {type_label} - {t['description']} (金额: {format_currency(t['total_amount'])})",
-            expanded=False
-        ):
+        if t["items"]:
+            types = {item["type"] for item in t["items"]}
+            is_same_direction = len(types) == 1
+            if is_same_direction:
+                only_type = list(types)[0]
+                dir_label = "双收入" if only_type == "income" else "双支出"
+            else:
+                is_same_direction = False
+                dir_label = ""
+        else:
+            is_same_direction = False
+            dir_label = ""
+
+        expand_title = f"{type_icon} {type_label} - {t['description']}"
+        if is_same_direction:
+            expand_title += f" ⚠️[{dir_label}]"
+        expand_title += f" (金额: {format_currency(t['total_amount'])})"
+
+        with st.expander(expand_title, expanded=False):
             st.write(f"**归并ID:** #{t['id']}")
             st.write(f"**创建时间:** {t['created_at']}")
+            if is_same_direction:
+                st.warning(f"⚠️ 此归并为同方向配对 ({dir_label})，适用于微信提现、信用卡重复扣款等场景")
 
             items_df = pd.DataFrame([
                 {
@@ -1160,7 +1210,14 @@ def render_confirmed_tab():
 def render_manual_create_tab():
     st.subheader("✋ 手动创建归并")
 
-    st.info("选择两条或多条流水，手动创建内部转账或报销抵扣归并")
+    st.markdown("""
+    <div class="info-card">
+    💡 **使用说明：**
+    - 支持选择任意 2 条或多条流水（包括同方向的双收入/双支出）
+    - 同方向配对常见场景：微信零钱提现(两条收入)、信用卡还款+自动扣款(两条支出)
+    - 可手动调整每条流水的角色（转出/转入/支出/退款）
+    </div>
+    """, unsafe_allow_html=True)
 
     all_txns = get_transactions()
     matched_ids = get_internal_transfer_txn_ids()
@@ -1173,10 +1230,13 @@ def render_manual_create_tab():
     txn_options = []
     for t in available_txns:
         sign = "+" if t["type"] == "income" else "-"
-        txn_options.append(f"#{t['id']} | {t['date']} | {t['description']} | {sign}{format_currency(t['amount'])}")
+        already_tag = ""
+        if any(kw in t["description"] for kw in INTERNAL_KEYWORDS_ALL):
+            already_tag = " 🔑"
+        txn_options.append(f"#{t['id']} | {t['date']} | {t['description']}{already_tag} | {sign}{format_currency(t['amount'])}")
 
     selected = st.multiselect(
-        "选择要归并的流水 (至少选择 1 条支出 + 1 条收入)",
+        "选择要归并的流水 (支持双收入/双支出等同方向配对)",
         options=list(range(len(available_txns))),
         format_func=lambda i: txn_options[i],
         max_selections=10
@@ -1187,9 +1247,54 @@ def render_manual_create_tab():
         incomes = [t for t in selected_txns if t["type"] == "income"]
         expenses = [t for t in selected_txns if t["type"] == "expense"]
 
+        same_direction = len(incomes) == 0 or len(expenses) == 0
+        if same_direction:
+            dir_label = "双收入" if len(incomes) > 0 else "双支出"
+            st.warning(f"⚠️ 检测到同方向配对({dir_label})，请确认角色分配是否正确")
+
         st.markdown(f"已选择 **{len(selected)}** 条流水:")
         st.markdown(f"- 收入: {len(incomes)} 条, 总计: {format_currency(sum(t['amount'] for t in incomes))}")
         st.markdown(f"- 支出: {len(expenses)} 条, 总计: {format_currency(sum(t['amount'] for t in expenses))}")
+
+        if len(incomes) == 0 and len(expenses) >= 2:
+            st.info("提示：双支出常见于 信用卡还款+自动扣款 等场景")
+        if len(expenses) == 0 and len(incomes) >= 2:
+            st.info("提示：双收入常见于 微信零钱提现到银行卡 等场景")
+
+        st.markdown("##### 调整每条流水的角色")
+
+        role_assignments = {}
+        for i, t in enumerate(selected_txns):
+            col1, col2, col3 = st.columns([1, 2, 2])
+            with col1:
+                sign = "+" if t["type"] == "income" else "-"
+                st.write(f"#{t['id']}")
+            with col2:
+                st.write(f"{t['date']} | {sign}{format_currency(t['amount'])}")
+                st.caption(t["description"])
+
+            default_role = None
+            if t["type"] == "expense":
+                default_role = "source"
+            else:
+                default_role = "destination"
+
+            role_options = [
+                ("转出 (source)", "source"),
+                ("转入 (destination)", "destination"),
+                ("支出 (expense)", "expense"),
+                ("退款 (refund)", "refund"),
+            ]
+
+            with col3:
+                selected_role = st.selectbox(
+                    f"角色 - 流水#{t['id']}",
+                    options=[r[1] for r in role_options],
+                    format_func=lambda x: [r[0] for r in role_options if r[1] == x][0],
+                    index=[r[1] for r in role_options].index(default_role) if default_role in [r[1] for r in role_options] else 0,
+                    key=f"manual_role_{t['id']}"
+                )
+                role_assignments[t["id"]] = selected_role
 
         preview_df = pd.DataFrame([
             {
@@ -1198,7 +1303,8 @@ def render_manual_create_tab():
                 "描述": t["description"],
                 "类型": "收入" if t["type"] == "income" else "支出",
                 "金额": format_currency(t["amount"] if t["type"] == "income" else -t["amount"]),
-                "分类": t["category"]
+                "分类": t["category"],
+                "分配角色": [r[0] for r in role_options if r[1] == role_assignments[t["id"]]][0]
             }
             for t in selected_txns
         ])
@@ -1208,26 +1314,25 @@ def render_manual_create_tab():
 
         col_type, col_desc = st.columns([1, 2])
         with col_type:
-            manual_type = st.selectbox("归并类型", ["内部转账", "报销抵扣"])
+            manual_type = st.selectbox("归并类型", ["内部转账", "报销抵扣"], key="manual_create_type")
         with col_desc:
-            manual_desc = st.text_input("备注描述", value=f"手动{manual_type}")
+            manual_desc = st.text_input("备注描述", value=f"手动{manual_type}", key="manual_create_desc")
 
-        if st.button("✅ 创建归并", type="primary"):
-            if not incomes or not expenses:
-                st.error("请至少选择 1 条收入和 1 条支出流水")
-            else:
-                items = []
-                t_type = "reimbursement" if manual_type == "报销抵扣" else "transfer"
-                for t in expenses:
-                    role = "expense" if t_type == "reimbursement" else "source"
-                    items.append((t["id"], role))
-                for t in incomes:
-                    role = "refund" if t_type == "reimbursement" else "destination"
-                    items.append((t["id"], role))
+        has_source = any(r in ("source", "expense") for r in role_assignments.values())
+        has_dest = any(r in ("destination", "refund") for r in role_assignments.values())
 
-                create_internal_transfer(t_type, manual_desc, items)
-                st.success(f"已创建{manual_type}归并！")
-                st.rerun()
+        if not has_source or not has_dest:
+            st.error("⚠️ 请至少分配一个'转出/支出'角色和一个'转入/退款'角色")
+
+        if st.button("✅ 创建归并", type="primary", disabled=(not has_source or not has_dest)):
+            items = []
+            t_type = "reimbursement" if manual_type == "报销抵扣" else "transfer"
+            for t in selected_txns:
+                items.append((t["id"], role_assignments[t["id"]]))
+
+            create_internal_transfer(t_type, manual_desc, items)
+            st.success(f"已创建{manual_type}归并！包含 {len(items)} 条流水")
+            st.rerun()
 
 
 def main():
