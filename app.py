@@ -10,7 +10,11 @@ from database import (
     get_rules, add_rule, update_rule, delete_rule,
     get_budgets, set_budget, get_monthly_summary,
     get_trend_data, update_transaction_category,
-    add_category, update_rule_priority, reorder_rules
+    add_category, update_rule_priority, reorder_rules,
+    create_internal_transfer, delete_internal_transfer,
+    get_internal_transfers, get_internal_transfer_by_id,
+    get_transfer_for_transaction, get_internal_transfer_txn_ids,
+    update_internal_transfer
 )
 from csv_importer import (
     read_csv_safely, validate_and_classify,
@@ -19,6 +23,11 @@ from csv_importer import (
 from rule_engine import (
     apply_rules_to_transactions, create_rule_from_transaction,
     get_rule_stats, suggest_rules_from_uncategorized
+)
+from transfer_engine import (
+    find_internal_transfer_candidates, find_transfers_with_keywords,
+    get_unmatched_internal_keyword_txns, auto_detect_transfer_type,
+    INTERNAL_KEYWORDS_ALL
 )
 
 st.set_page_config(
@@ -177,6 +186,20 @@ def render_import_page():
                 if st.button("🚀 确认导入数据", type="primary"):
                     inserted, duplicates = insert_valid_rows(valid_preview)
                     st.success(f"导入完成！新增 {inserted} 条，跳过 {duplicates + result['stats']['duplicates']} 条重复")
+
+                    has_internal_keywords = False
+                    internal_count = 0
+                    for r in valid_preview:
+                        if any(kw in r["description"] for kw in INTERNAL_KEYWORDS_ALL):
+                            internal_count += 1
+                            has_internal_keywords = True
+
+                    if has_internal_keywords:
+                        st.info(
+                            f"💡 检测到 {internal_count} 条可能为内部转账/报销的流水，"
+                            f"建议前往「内部转账」页面进行归并处理"
+                        )
+
                     if stats["uncategorized"] > 0:
                         st.info("💡 建议前往「分类规则」页面，从高频未分类描述中生成规则")
                     st.rerun()
@@ -189,6 +212,31 @@ def render_import_page():
     st.subheader("📊 已有流水概览")
     all_txns = get_transactions()
     if all_txns:
+        transfer_txn_ids = get_internal_transfer_txn_ids()
+
+        col_filter, col_stats = st.columns([2, 3])
+        with col_filter:
+            show_internal = st.selectbox(
+                "显示范围",
+                ["全部流水", "仅日常收支 (不含内部转账)", "仅内部转账"],
+                index=0
+            )
+
+        with col_stats:
+            internal_count = len(transfer_txn_ids)
+            normal_count = len(all_txns) - internal_count
+            st.markdown(
+                f"📊 共 {len(all_txns)} 条 | "
+                f"✅ 日常收支: {normal_count} 条 | "
+                f"🔄 内部转账: {internal_count} 条"
+            )
+
+        display_txns = all_txns
+        if show_internal == "仅日常收支 (不含内部转账)":
+            display_txns = [t for t in all_txns if t["id"] not in transfer_txn_ids]
+        elif show_internal == "仅内部转账":
+            display_txns = [t for t in all_txns if t["id"] in transfer_txn_ids]
+
         txn_df = pd.DataFrame([
             {
                 "ID": t["id"],
@@ -196,19 +244,73 @@ def render_import_page():
                 "描述": t["description"],
                 "类型": "收入" if t["type"] == "income" else "支出",
                 "金额": t["amount"] if t["type"] == "income" else -t["amount"],
-                "分类": t["category"]
+                "分类": t["category"],
+                "状态": "🔄 内部转账" if t["id"] in transfer_txn_ids else "✅ 正常"
             }
-            for t in all_txns
+            for t in display_txns
         ])
-        st.dataframe(txn_df.head(100), use_container_width=True, hide_index=True)
+        st.dataframe(txn_df.head(200), use_container_width=True, hide_index=True)
+
+        if show_internal != "仅日常收支 (不含内部转账)":
+            st.divider()
+            st.subheader("🔍 流水详情与归并追溯")
+            detail_txn_id = st.number_input(
+                "输入流水ID查看详情",
+                min_value=1,
+                value=1 if all_txns else 0,
+                step=1
+            )
+            if detail_txn_id:
+                detail_txn = None
+                for t in all_txns:
+                    if t["id"] == detail_txn_id:
+                        detail_txn = t
+                        break
+
+                if detail_txn:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**日期:** {detail_txn['date']}")
+                        st.write(f"**描述:** {detail_txn['description']}")
+                        st.write(f"**类型:** {'收入' if detail_txn['type'] == 'income' else '支出'}")
+                        st.write(f"**金额:** {format_currency(detail_txn['amount'] if detail_txn['type'] == 'income' else -detail_txn['amount'])}")
+                        st.write(f"**分类:** {detail_txn['category']}")
+
+                    transfer_info = get_transfer_for_transaction(detail_txn_id)
+                    with col2:
+                        if transfer_info:
+                            type_icon = "💼" if transfer_info["transfer_type"] == "reimbursement" else "🔄"
+                            type_label = "报销抵扣" if transfer_info["transfer_type"] == "reimbursement" else "内部转账"
+                            st.markdown(f"**归并状态:** {type_icon} 已归并为{type_label}")
+                            st.write(f"**归并ID:** #{transfer_info['id']}")
+                            st.write(f"**归并描述:** {transfer_info['description']}")
+                            st.write(f"**归并时间:** {transfer_info['created_at']}")
+
+                            if st.button("📂 查看完整归并"):
+                                st.session_state["transfer_detail_id"] = transfer_info["id"]
+
+                            if st.button("🗑️ 拆开此归并"):
+                                delete_internal_transfer(transfer_info["id"])
+                                st.success("已拆开归并，流水恢复为独立记录")
+                                st.rerun()
+                        else:
+                            st.info("此流水为独立记录，未参与归并")
+                            if st.button("➕ 加入手动归并"):
+                                st.info("请前往「内部转账」页面的「手动创建」标签进行操作")
+                else:
+                    st.warning("未找到该流水ID")
 
         st.divider()
         st.subheader("✏️ 手动修正分类")
         cat_exp = [c["name"] for c in get_categories("expense")]
         cat_inc = [c["name"] for c in get_categories("income")]
 
-        edit_ids = st.multiselect("选择要修改的流水ID", options=txn_df["ID"].tolist(), format_func=lambda x: f"#{x}")
+        edit_ids = st.multiselect("选择要修改的流水ID", options=[t["id"] for t in display_txns], format_func=lambda x: f"#{x}")
         if edit_ids:
+            has_internal = any(tid in transfer_txn_ids for tid in edit_ids)
+            if has_internal:
+                st.warning("⚠️ 您选择了已归并的内部转账流水，修改分类不会影响收支统计，但建议保持分类一致")
+
             edit_type_selected = st.radio("分类类型", ["支出", "收入"])
             cat_list = cat_inc if edit_type_selected == "收入" else cat_exp
             new_cat = st.selectbox("选择新分类", cat_list)
@@ -405,10 +507,25 @@ def render_budget_page():
     months = get_available_months()
     selected_month = st.selectbox("选择月份", months, index=0)
 
-    summary = get_monthly_summary(selected_month)
+    col_mode, col_info = st.columns([1, 3])
+    with col_mode:
+        exclude_internal = st.checkbox(
+            "排除内部转账",
+            value=True,
+            help="内部转账/报销抵扣不计入日常收支和预算"
+        )
+    with col_info:
+        if exclude_internal:
+            st.info("💡 当前统计已排除内部转账和报销抵扣，仅显示日常收支")
+
+    summary = get_monthly_summary(selected_month, exclude_internal=exclude_internal)
+    summary_all = get_monthly_summary(selected_month, exclude_internal=False)
     budgets = get_budgets(selected_month)
     expense_cats = get_categories("expense")
     expense_cat_names = [c["name"] for c in expense_cats]
+
+    internal_expense = summary_all["expense_total"] - summary["expense_total"]
+    internal_income = summary_all["income_total"] - summary["income_total"]
 
     col1, col2, col3 = st.columns(3)
     col1.metric("💰 总收入", format_currency(summary["income_total"]))
@@ -419,6 +536,13 @@ def render_budget_page():
         f"{'📈 结余' if summary['balance'] >= 0 else '📉 赤字'}: {format_currency(summary['balance'])}</h3>",
         unsafe_allow_html=True
     )
+
+    if exclude_internal and (internal_expense > 0 or internal_income > 0):
+        st.markdown(f"""
+        <div class="info-card">
+        🔄 **内部转账统计** (已排除): 支出 {format_currency(internal_expense)} | 收入 {format_currency(internal_income)}
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
     st.subheader("🎯 设置预算")
@@ -616,7 +740,19 @@ def render_trend_page():
     if start_month > end_month:
         start_month, end_month = end_month, start_month
 
-    trend_data = get_trend_data(start_month, end_month)
+    col_mode, col_info = st.columns([1, 3])
+    with col_mode:
+        exclude_internal = st.checkbox(
+            "排除内部转账",
+            value=True,
+            help="内部转账/报销抵扣不计入趋势统计"
+        )
+    with col_info:
+        if exclude_internal:
+            st.info("💡 当前趋势已排除内部转账和报销抵扣，仅显示日常收支")
+
+    trend_data = get_trend_data(start_month, end_month, exclude_internal=exclude_internal)
+    trend_data_all = get_trend_data(start_month, end_month, exclude_internal=False)
     summary_by_month = {}
 
     for item in trend_data:
@@ -627,6 +763,16 @@ def render_trend_page():
             summary_by_month[m]["income"] += item["total"]
         else:
             summary_by_month[m]["expense"] += item["total"]
+
+    summary_all_by_month = {}
+    for item in trend_data_all:
+        m = item["month"]
+        if m not in summary_all_by_month:
+            summary_all_by_month[m] = {"income": 0, "expense": 0}
+        if item["type"] == "income":
+            summary_all_by_month[m]["income"] += item["total"]
+        else:
+            summary_all_by_month[m]["expense"] += item["total"]
 
     month_list = sorted(summary_by_month.keys())
     if not month_list:
@@ -641,6 +787,18 @@ def render_trend_page():
     col2.metric(f"{start_month} ~ {end_month} 总支出", format_currency(total_expense))
     balance = total_income - total_expense
     col3.metric("累计结余", format_currency(balance), delta=f"{len(month_list)} 个月")
+
+    if exclude_internal and summary_all_by_month:
+        total_income_all = sum(v["income"] for v in summary_all_by_month.values())
+        total_expense_all = sum(v["expense"] for v in summary_all_by_month.values())
+        internal_income = total_income_all - total_income
+        internal_expense = total_expense_all - total_expense
+        if internal_income > 0 or internal_expense > 0:
+            st.markdown(f"""
+            <div class="info-card">
+            🔄 **内部转账统计** (已排除): 收入 {format_currency(internal_income)} | 支出 {format_currency(internal_expense)}
+            </div>
+            """, unsafe_allow_html=True)
 
     st.divider()
 
@@ -757,13 +915,328 @@ def render_trend_page():
     st.dataframe(month_df, use_container_width=True, hide_index=True)
 
 
+def render_internal_transfer_page():
+    st.markdown('<div class="main-header">🔄 内部转账与报销归并</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="info-card">
+    💡 **功能说明：**
+    - 自动识别银行卡互转、信用卡还款、微信零钱提现、同事报销等内部流水
+    - 归并后不计入日常收支，避免预算和趋势统计失真
+    - 明细可追溯，随时可拆开恢复
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.divider()
+
+    tab_candidates, tab_confirmed, tab_manual = st.tabs(
+        ["🤖 候选匹配", "✅ 已确认", "✋ 手动创建"]
+    )
+
+    with tab_candidates:
+        render_candidates_tab()
+
+    with tab_confirmed:
+        render_confirmed_tab()
+
+    with tab_manual:
+        render_manual_create_tab()
+
+
+def render_candidates_tab():
+    st.subheader("🔍 自动匹配候选")
+
+    col_settings, col_refresh = st.columns([3, 1])
+    with col_settings:
+        date_window = st.slider("日期窗口 (天)", min_value=1, max_value=15, value=3)
+
+    with col_refresh:
+        st.write("")
+        if st.button("🔄 重新检测", type="primary"):
+            st.rerun()
+
+    with st.spinner("正在分析流水，寻找内部转账候选..."):
+        candidates = find_internal_transfer_candidates(date_window_days=date_window)
+        unmatched = get_unmatched_internal_keyword_txns()
+
+    if not candidates and not unmatched:
+        st.success("🎉 目前没有检测到内部转账候选，所有流水都已处理")
+        return
+
+    if candidates:
+        st.markdown(f"##### 找到 {len(candidates)} 个匹配候选")
+
+        high_conf = [c for c in candidates if c["confidence"] >= 0.7]
+        med_conf = [c for c in candidates if 0.4 <= c["confidence"] < 0.7]
+        low_conf = [c for c in candidates if c["confidence"] < 0.4]
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("高置信度 (≥0.7)", len(high_conf))
+        col2.metric("中置信度 (0.4-0.7)", len(med_conf))
+        col3.metric("低置信度 (<0.4)", len(low_conf))
+
+        st.divider()
+
+        for idx, candidate in enumerate(candidates):
+            with st.container():
+                confidence = candidate["confidence"]
+                conf_color = "green" if confidence >= 0.7 else ("orange" if confidence >= 0.4 else "red")
+                type_label = "报销抵扣" if candidate["type"] == "reimbursement" else "内部转账"
+                type_icon = "💼" if candidate["type"] == "reimbursement" else "🔄"
+
+                warnings = []
+                if candidate["cross_month"]:
+                    warnings.append("⚠️ 跨月匹配")
+                if not candidate["amount_match"]:
+                    warnings.append(f"⚠️ 金额不一致 (差¥{candidate['amount_diff']})")
+
+                st.markdown(f"""
+                <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; margin: 8px 0;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <span style="font-size: 1.1em; font-weight: bold;">{type_icon} {type_label}</span>
+                            <span style="margin-left: 12px; color: {conf_color}; font-weight: bold;">
+                                置信度: {confidence:.2f}
+                            </span>
+                        </div>
+                        <div style="color: #666; font-size: 0.9em;">
+                            {' '.join(candidate['reasons'])}
+                        </div>
+                    </div>
+                    {''.join(f'<div style="color: #ff9800; margin-top: 4px;">{w}</div>' for w in warnings)}
+                </div>
+                """, unsafe_allow_html=True)
+
+                items_df = pd.DataFrame([
+                    {
+                        "日期": item["transaction"]["date"],
+                        "描述": item["transaction"]["description"],
+                        "类型": "收入" if item["transaction"]["type"] == "income" else "支出",
+                        "金额": format_currency(
+                            item["transaction"]["amount"] if item["transaction"]["type"] == "income"
+                            else -item["transaction"]["amount"]
+                        ),
+                        "分类": item["transaction"]["category"],
+                        "角色": "转出/支出" if item["role"] in ("source", "expense") else "转入/退款"
+                    }
+                    for item in candidate["items"]
+                ])
+                st.dataframe(items_df, use_container_width=True, hide_index=True)
+
+                col_confirm, col_skip, col_edit = st.columns([2, 1, 2])
+
+                with col_confirm:
+                    if st.button(f"✓ 确认归并", key=f"confirm_candidate_{idx}", type="primary"):
+                        items = [
+                            (item["transaction"]["id"], item["role"])
+                            for item in candidate["items"]
+                        ]
+                        desc = f"{type_label}: {candidate['items'][0]['transaction']['description']} ↔ {candidate['items'][1]['transaction']['description']}"
+                        create_internal_transfer(candidate["type"], desc, items)
+                        st.success("已确认归并！")
+                        st.rerun()
+
+                with col_edit:
+                    with st.expander("✏️ 编辑后确认"):
+                        edit_type = st.selectbox(
+                            "归并类型",
+                            ["内部转账", "报销抵扣"],
+                            index=0 if candidate["type"] == "transfer" else 1,
+                            key=f"edit_type_{idx}"
+                        )
+                        edit_desc = st.text_input(
+                            "备注描述",
+                            value=f"{type_label}: {candidate['items'][0]['transaction']['description'][:20]}...",
+                            key=f"edit_desc_{idx}"
+                        )
+                        if st.button("保存并确认", key=f"save_edit_candidate_{idx}"):
+                            t_type = "reimbursement" if edit_type == "报销抵扣" else "transfer"
+                            items = [
+                                (item["transaction"]["id"], item["role"])
+                                for item in candidate["items"]
+                            ]
+                            create_internal_transfer(t_type, edit_desc, items)
+                            st.success("已确认归并！")
+                            st.rerun()
+
+                st.divider()
+
+    if unmatched:
+        st.markdown(f"##### 🔔 未匹配的内部转账关键词流水 ({len(unmatched)} 条)")
+        st.info("这些流水包含内部转账关键词，但未找到匹配的对应流水，请手动处理")
+
+        unmatched_df = pd.DataFrame([
+            {
+                "ID": u["transaction"]["id"],
+                "日期": u["transaction"]["date"],
+                "描述": u["transaction"]["description"],
+                "类型": "收入" if u["transaction"]["type"] == "income" else "支出",
+                "金额": format_currency(
+                    u["transaction"]["amount"] if u["transaction"]["type"] == "income"
+                    else -u["transaction"]["amount"]
+                ),
+                "匹配关键词": "、".join(u["matched_keywords"])
+            }
+            for u in unmatched
+        ])
+        st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
+
+
+def render_confirmed_tab():
+    st.subheader("✅ 已确认的归并记录")
+
+    transfers = get_internal_transfers()
+
+    if not transfers:
+        st.info("暂无已确认的归并记录")
+        return
+
+    transfer_count = len([t for t in transfers if t["transfer_type"] == "transfer"])
+    reimburse_count = len([t for t in transfers if t["transfer_type"] == "reimbursement"])
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("归并总数", len(transfers))
+    col2.metric("内部转账", transfer_count)
+    col3.metric("报销抵扣", reimburse_count)
+
+    st.divider()
+
+    for t in transfers:
+        type_icon = "💼" if t["transfer_type"] == "reimbursement" else "🔄"
+        type_label = "报销抵扣" if t["transfer_type"] == "reimbursement" else "内部转账"
+
+        with st.expander(
+            f"{type_icon} {type_label} - {t['description']} (金额: {format_currency(t['total_amount'])})",
+            expanded=False
+        ):
+            st.write(f"**归并ID:** #{t['id']}")
+            st.write(f"**创建时间:** {t['created_at']}")
+
+            items_df = pd.DataFrame([
+                {
+                    "ID": item["transaction_id"],
+                    "日期": item["date"],
+                    "描述": item["txn_description"],
+                    "类型": "收入" if item["type"] == "income" else "支出",
+                    "金额": format_currency(
+                        item["amount"] if item["type"] == "income" else -item["amount"]
+                    ),
+                    "分类": item["category"],
+                    "角色": "转出/支出" if item["role"] in ("source", "expense") else "转入/退款"
+                }
+                for item in t["items"]
+            ])
+            st.dataframe(items_df, use_container_width=True, hide_index=True)
+
+            col_edit, col_delete = st.columns(2)
+
+            with col_edit:
+                with st.expander("✏️ 编辑归并"):
+                    new_desc = st.text_input(
+                        "修改描述",
+                        value=t["description"],
+                        key=f"edit_transfer_desc_{t['id']}"
+                    )
+                    new_type = st.selectbox(
+                        "修改类型",
+                        ["内部转账", "报销抵扣"],
+                        index=0 if t["transfer_type"] == "transfer" else 1,
+                        key=f"edit_transfer_type_{t['id']}"
+                    )
+                    if st.button("保存修改", key=f"save_transfer_edit_{t['id']}"):
+                        t_type = "reimbursement" if new_type == "报销抵扣" else "transfer"
+                        items = [(item["transaction_id"], item["role"]) for item in t["items"]]
+                        update_internal_transfer(t["id"], description=new_desc, items=items)
+                        st.success("修改已保存")
+                        st.rerun()
+
+            with col_delete:
+                if st.button("🗑️ 拆开归并 (恢复原流水)", key=f"delete_transfer_{t['id']}"):
+                    delete_internal_transfer(t["id"])
+                    st.success("已拆开归并，流水恢复为独立记录")
+                    st.rerun()
+
+
+def render_manual_create_tab():
+    st.subheader("✋ 手动创建归并")
+
+    st.info("选择两条或多条流水，手动创建内部转账或报销抵扣归并")
+
+    all_txns = get_transactions()
+    matched_ids = get_internal_transfer_txn_ids()
+    available_txns = [t for t in all_txns if t["id"] not in matched_ids]
+
+    if len(available_txns) < 2:
+        st.warning("可用流水不足 2 条，无法手动创建归并")
+        return
+
+    txn_options = []
+    for t in available_txns:
+        sign = "+" if t["type"] == "income" else "-"
+        txn_options.append(f"#{t['id']} | {t['date']} | {t['description']} | {sign}{format_currency(t['amount'])}")
+
+    selected = st.multiselect(
+        "选择要归并的流水 (至少选择 1 条支出 + 1 条收入)",
+        options=list(range(len(available_txns))),
+        format_func=lambda i: txn_options[i],
+        max_selections=10
+    )
+
+    if selected:
+        selected_txns = [available_txns[i] for i in selected]
+        incomes = [t for t in selected_txns if t["type"] == "income"]
+        expenses = [t for t in selected_txns if t["type"] == "expense"]
+
+        st.markdown(f"已选择 **{len(selected)}** 条流水:")
+        st.markdown(f"- 收入: {len(incomes)} 条, 总计: {format_currency(sum(t['amount'] for t in incomes))}")
+        st.markdown(f"- 支出: {len(expenses)} 条, 总计: {format_currency(sum(t['amount'] for t in expenses))}")
+
+        preview_df = pd.DataFrame([
+            {
+                "ID": t["id"],
+                "日期": t["date"],
+                "描述": t["description"],
+                "类型": "收入" if t["type"] == "income" else "支出",
+                "金额": format_currency(t["amount"] if t["type"] == "income" else -t["amount"]),
+                "分类": t["category"]
+            }
+            for t in selected_txns
+        ])
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        col_type, col_desc = st.columns([1, 2])
+        with col_type:
+            manual_type = st.selectbox("归并类型", ["内部转账", "报销抵扣"])
+        with col_desc:
+            manual_desc = st.text_input("备注描述", value=f"手动{manual_type}")
+
+        if st.button("✅ 创建归并", type="primary"):
+            if not incomes or not expenses:
+                st.error("请至少选择 1 条收入和 1 条支出流水")
+            else:
+                items = []
+                t_type = "reimbursement" if manual_type == "报销抵扣" else "transfer"
+                for t in expenses:
+                    role = "expense" if t_type == "reimbursement" else "source"
+                    items.append((t["id"], role))
+                for t in incomes:
+                    role = "refund" if t_type == "reimbursement" else "destination"
+                    items.append((t["id"], role))
+
+                create_internal_transfer(t_type, manual_desc, items)
+                st.success(f"已创建{manual_type}归并！")
+                st.rerun()
+
+
 def main():
     st.sidebar.title("💰 个人预算复盘")
     st.sidebar.markdown("---")
 
     page = st.sidebar.radio(
         "导航菜单",
-        ["📥 流水导入", "⚙️ 分类规则", "📋 月度预算", "📈 趋势分析"],
+        ["📥 流水导入", "⚙️ 分类规则", "� 内部转账", "�� 月度预算", "📈 趋势分析"],
         index=0
     )
 
@@ -772,17 +1245,23 @@ def main():
         "💡 **使用说明：**\n"
         "1. 在「流水导入」上传银行CSV\n"
         "2. 在「分类规则」管理匹配规则\n"
-        "3. 在「月度预算」设置并查看预算\n"
-        "4. 在「趋势分析」查看历史走势"
+        "3. 在「内部转账」归并内部流水\n"
+        "4. 在「月度预算」设置并查看预算\n"
+        "5. 在「趋势分析」查看历史走势"
     )
 
     total_txns = len(get_transactions())
     st.sidebar.metric("📊 流水总数", total_txns)
 
+    transfer_ids = get_internal_transfer_txn_ids()
+    st.sidebar.metric("🔄 已归并流水", len(transfer_ids))
+
     if page == "📥 流水导入":
         render_import_page()
     elif page == "⚙️ 分类规则":
         render_rules_page()
+    elif page == "🔄 内部转账":
+        render_internal_transfer_page()
     elif page == "📋 月度预算":
         render_budget_page()
     elif page == "📈 趋势分析":

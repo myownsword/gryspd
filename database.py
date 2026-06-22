@@ -65,6 +65,34 @@ def init_db():
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS internal_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transfer_type TEXT NOT NULL CHECK(transfer_type IN ('transfer', 'reimbursement')),
+                description TEXT NOT NULL DEFAULT '',
+                total_amount REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS internal_transfer_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transfer_id INTEGER NOT NULL,
+                transaction_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('source', 'destination', 'expense', 'refund')),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (transfer_id) REFERENCES internal_transfers(id) ON DELETE CASCADE,
+                FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE,
+                UNIQUE(transaction_id)
+            )
+        """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfer_items_txn ON internal_transfer_items(transaction_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfer_items_transfer ON internal_transfer_items(transfer_id)")
+
         default_categories = [
             ("工资", "income"), ("奖金", "income"), ("投资收益", "income"),
             ("其他收入", "income"),
@@ -301,15 +329,160 @@ def delete_budget(budget_id: int):
         cursor.execute("DELETE FROM budgets WHERE id = ?", (budget_id,))
 
 
-def get_monthly_summary(month: str) -> Dict:
+def create_internal_transfer(transfer_type: str, description: str,
+                             items: List[Tuple[int, str]]) -> int:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+
+        cursor.execute("""
+            INSERT INTO internal_transfers (transfer_type, description, total_amount, status, created_at, updated_at)
+            VALUES (?, ?, 0, 'confirmed', ?, ?)
+        """, (transfer_type, description, now, now))
+        transfer_id = cursor.lastrowid
+
+        total = 0.0
+        for txn_id, role in items:
+            cursor.execute("""
+                INSERT INTO internal_transfer_items (transfer_id, transaction_id, role, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (transfer_id, txn_id, role, now))
+
+            cursor.execute("SELECT amount, type FROM transactions WHERE id = ?", (txn_id,))
+            row = cursor.fetchone()
+            if row:
+                amt = row["amount"] if row["type"] == "income" else -row["amount"]
+                total += abs(amt) if role in ('source', 'expense') else 0
+
+        cursor.execute("""
+            UPDATE internal_transfers SET total_amount = ? WHERE id = ?
+        """, (total / 2 if total > 0 else 0, transfer_id))
+
+        return transfer_id
+
+
+def delete_internal_transfer(transfer_id: int):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM internal_transfer_items WHERE transfer_id = ?", (transfer_id,))
+        cursor.execute("DELETE FROM internal_transfers WHERE id = ?", (transfer_id,))
+
+
+def get_internal_transfers(transfer_type: Optional[str] = None) -> List[Dict]:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if transfer_type:
+            cursor.execute("""
+                SELECT * FROM internal_transfers
+                WHERE transfer_type = ?
+                ORDER BY created_at DESC
+            """, (transfer_type,))
+        else:
+            cursor.execute("""
+                SELECT * FROM internal_transfers
+                ORDER BY created_at DESC
+            """)
+        transfers = [dict(row) for row in cursor.fetchall()]
+
+        for t in transfers:
+            cursor.execute("""
+                SELECT ti.*, t.date, t.description as txn_description, t.amount, t.type, t.category
+                FROM internal_transfer_items ti
+                JOIN transactions t ON ti.transaction_id = t.id
+                WHERE ti.transfer_id = ?
+                ORDER BY t.date
+            """, (t["id"],))
+            t["items"] = [dict(row) for row in cursor.fetchall()]
+
+        return transfers
+
+
+def get_internal_transfer_by_id(transfer_id: int) -> Optional[Dict]:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM internal_transfers WHERE id = ?", (transfer_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        transfer = dict(row)
+
+        cursor.execute("""
+            SELECT ti.*, t.date, t.description as txn_description, t.amount, t.type, t.category
+            FROM internal_transfer_items ti
+            JOIN transactions t ON ti.transaction_id = t.id
+            WHERE ti.transfer_id = ?
+            ORDER BY t.date
+        """, (transfer_id,))
+        transfer["items"] = [dict(row) for row in cursor.fetchall()]
+        return transfer
+
+
+def get_transfer_for_transaction(txn_id: int) -> Optional[Dict]:
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT category, type, SUM(amount) as total
-            FROM transactions
-            WHERE strftime('%Y-%m', date) = ?
-            GROUP BY category, type
-        """, (month,))
+            SELECT transfer_id FROM internal_transfer_items WHERE transaction_id = ?
+        """, (txn_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return get_internal_transfer_by_id(row["transfer_id"])
+
+
+def get_internal_transfer_txn_ids() -> set:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT transaction_id FROM internal_transfer_items")
+        return {row["transaction_id"] for row in cursor.fetchall()}
+
+
+def update_internal_transfer(transfer_id: int, description: str = None,
+                             items: List[Tuple[int, str]] = None):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+
+        if description is not None:
+            cursor.execute("""
+                UPDATE internal_transfers SET description = ?, updated_at = ? WHERE id = ?
+            """, (description, now, transfer_id))
+
+        if items is not None:
+            cursor.execute("DELETE FROM internal_transfer_items WHERE transfer_id = ?", (transfer_id,))
+            total = 0.0
+            for txn_id, role in items:
+                cursor.execute("""
+                    INSERT INTO internal_transfer_items (transfer_id, transaction_id, role, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (transfer_id, txn_id, role, now))
+                cursor.execute("SELECT amount, type FROM transactions WHERE id = ?", (txn_id,))
+                row = cursor.fetchone()
+                if row:
+                    amt = row["amount"] if row["type"] == "income" else -row["amount"]
+                    total += abs(amt) if role in ('source', 'expense') else 0
+            cursor.execute("""
+                UPDATE internal_transfers SET total_amount = ?, updated_at = ? WHERE id = ?
+            """, (total / 2 if total > 0 else 0, now, transfer_id))
+
+
+def get_monthly_summary(month: str, exclude_internal: bool = True) -> Dict:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if exclude_internal:
+            cursor.execute("""
+                SELECT t.category, t.type, SUM(t.amount) as total
+                FROM transactions t
+                LEFT JOIN internal_transfer_items iti ON t.id = iti.transaction_id
+                WHERE strftime('%Y-%m', t.date) = ? AND iti.transaction_id IS NULL
+                GROUP BY t.category, t.type
+            """, (month,))
+        else:
+            cursor.execute("""
+                SELECT category, type, SUM(amount) as total
+                FROM transactions
+                WHERE strftime('%Y-%m', date) = ?
+                GROUP BY category, type
+            """, (month,))
         rows = cursor.fetchall()
 
         income_total = 0.0
@@ -332,18 +505,32 @@ def get_monthly_summary(month: str) -> Dict:
         }
 
 
-def get_trend_data(start_month: str, end_month: str) -> List[Dict]:
+def get_trend_data(start_month: str, end_month: str, exclude_internal: bool = True) -> List[Dict]:
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT
-                strftime('%Y-%m', date) as month,
-                category,
-                type,
-                SUM(amount) as total
-            FROM transactions
-            WHERE strftime('%Y-%m', date) BETWEEN ? AND ?
-            GROUP BY month, category, type
-            ORDER BY month, category
-        """, (start_month, end_month))
+        if exclude_internal:
+            cursor.execute("""
+                SELECT
+                    strftime('%Y-%m', t.date) as month,
+                    t.category,
+                    t.type,
+                    SUM(t.amount) as total
+                FROM transactions t
+                LEFT JOIN internal_transfer_items iti ON t.id = iti.transaction_id
+                WHERE strftime('%Y-%m', t.date) BETWEEN ? AND ? AND iti.transaction_id IS NULL
+                GROUP BY month, t.category, t.type
+                ORDER BY month, t.category
+            """, (start_month, end_month))
+        else:
+            cursor.execute("""
+                SELECT
+                    strftime('%Y-%m', date) as month,
+                    category,
+                    type,
+                    SUM(amount) as total
+                FROM transactions
+                WHERE strftime('%Y-%m', date) BETWEEN ? AND ?
+                GROUP BY month, category, type
+                ORDER BY month, category
+            """, (start_month, end_month))
         return [dict(row) for row in cursor.fetchall()]
